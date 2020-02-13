@@ -161,6 +161,15 @@ The "message" RPC implements a keysend-like functionality: we know about the rec
 It's this plugin routing table that we want to fully integrate with the underlying goTenna routing table in future work.
 
 
+# TODOs:
 
+
+- [ ] Fix first hop routing selection
+
+- [x] Fix bi-directional messaging (add `push_msat` to channel open?)
+
+- [ ] Calculate C_FEE and CLTV_DELTA on the fly from `getroute` rather than hardcoding
+
+- [ ] Integrate routing algorithm with the underlying goTenna routing
     
     
