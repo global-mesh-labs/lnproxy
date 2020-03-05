@@ -2,7 +2,6 @@ import logging
 import socket
 
 import trio
-from util import hexdump
 
 
 logging.basicConfig(level=logging.DEBUG)
@@ -37,7 +36,6 @@ async def proxy(read_stream, write_stream, direction):
                 break
             await write_stream.send_all(data)
             logger.debug(f"{direction}: {len(data)}B ")
-            hexdump(data)
         except:
             raise
 
