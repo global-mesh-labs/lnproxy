@@ -3,9 +3,8 @@ import logging
 import trio
 import trio.testing
 
-import lnproxy.config as config
-from lnproxy.util import CustomAdapter
-
+import src.config as config
+from src.util import CustomAdapter
 
 logger = CustomAdapter(logging.getLogger("network"), None)
 
@@ -18,7 +17,8 @@ class Node:
         self, gid: int, pubkey: str, outbound=None, inbound=None, shared_key=None
     ):
         self.gid = gid
-        self.short_gid = gid % 256
+        # Short GID will be represented as GID modulo 256 * no. bytes allowed
+        self.short_gid = gid % (256 * config.user.getint("message", "SEND_ID_LEN"))
         self.pubkey = pubkey
         self.outbound = outbound
         self.inbound = inbound
@@ -39,7 +39,7 @@ class Node:
         return self.gid == other.gid and self.pubkey == other.pubkey
 
     def init_queues(self):
-        self.outbound = config.mesh_conn.to_mesh_send.clone()
+        self.outbound = config.connection.to_mesh_send.clone()
         self.inbound = trio.testing.memory_stream_one_way_pair()
 
 

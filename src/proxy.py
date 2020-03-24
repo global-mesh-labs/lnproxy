@@ -3,11 +3,10 @@ import logging
 
 import trio
 
-import lnproxy.config as config
-import lnproxy.messages as msg
-import lnproxy.network as network
-import lnproxy.util as util
-
+import src.config as config
+import src.messages as msg
+import src.network as network
+import src.util as util
 
 logger = util.CustomAdapter(logging.getLogger("proxy"), None)
 router = network.router
@@ -24,9 +23,9 @@ class Proxy:
         self.q_init = q_init
         self.router = router
         self.node = router.get_node(gid)
-        self.count_to_mesh = 0
-        self.bytes_to_mesh = 0
-        self.bytes_from_mesh = 0
+        self.count_to_remote = 0
+        self.bytes_to_remote = 0
+        self.bytes_from_remote = 0
 
     async def read_message(
         self,
@@ -34,34 +33,35 @@ class Proxy:
         i,
         hs_acts: int,
         initiator: bool,
-        to_mesh: bool,
+        to_remote: bool,
         cancel_scope=None,
     ) -> bytes:
-        """A stream reader which reads a handshake or lightning message and returns it.
+        """A stream reader which reads a handshake or lightning message parses it and
+        returns it.
         """
         if i < hs_acts:
             message = await msg.HandshakeMessage.read(stream, i, initiator)
             logger.debug(f"Read HS message {i}")
             return bytes(message.message)
         else:
-            if to_mesh:
+            if to_remote:
                 message = await msg.LightningMessage.from_stream(
-                    stream, to_mesh, self.stream, cancel_scope
+                    stream, to_remote, self.stream, cancel_scope
                 )
             else:
                 message = await msg.LightningMessage.from_stream(
-                    stream, to_mesh, self.stream, None
+                    stream, to_remote, self.stream, None
                 )
             if await message.parse():
                 return bytes(message.returned_msg)
             return b""
 
-    async def _to_mesh(self, read, write, initiator: bool):
+    async def _to_remote(self, read, write, initiator: bool):
         """Read from Local SocketStream and write to a MemoryStream.
         Will try to batch messages.
         Should not be called directly, instead use start().
         """
-        logger.debug(f"Starting proxy to_mesh, initiator={initiator}")
+        logger.debug(f"Starting proxy to_remote, initiator={initiator}")
         i = 0
         hs_acts = 2 if initiator else 1
         while True:
@@ -73,7 +73,7 @@ class Proxy:
             i += 1
 
             # After we've got one, check to see if more can be batched
-            with trio.move_on_after(config.user["gotenna"].getint("BATCH_DELAY")) as cs:
+            with trio.move_on_after(config.user["message"].getint("BATCH_DELAY")) as cs:
                 while True:
                     message += await self.read_message(
                         read, i, hs_acts, initiator, True, cs
@@ -82,41 +82,41 @@ class Proxy:
                     batched += 1
             if batched:
                 logger.info(f"Batched {batched + 1} messages")
-            self.bytes_to_mesh += len(message)
+            self.bytes_to_remote += len(message)
 
-            # Chunk the message and send them to the mesh
+            # Chunk the message and send them to the remote
             for _msg in util.chunk_to_list(
                 bytes(message),
-                config.user["gotenna"].getint("CHUNK_SIZE"),
+                config.user["message"].getint("CHUNK_SIZE"),
                 self.gid.to_bytes(8, "big"),
             ):
                 await write(_msg)
-                self.count_to_mesh += 1
+                self.count_to_remote += 1
             logger.debug(
                 f"Sent | "
                 f"read: {i}, "
-                f"sent: {self.count_to_mesh}, "
-                f"total_size: {self.bytes_to_mesh}B"
+                f"sent: {self.count_to_remote}, "
+                f"total_size: {self.bytes_to_remote}B"
             )
 
-    async def _from_mesh(self, read, write, init: bool):
+    async def _from_remote(self, read, write, init: bool):
         """Read from a SocketStream and write to a trio.MemorySendChannel
-        (the mesh "queue") or a trio.SocketStream.
-        Should not be called directly, instead use start().
+        (the receive "queue") or a trio.SocketStream.
+        Should not be called directly, instead use Proxy.start().
         """
-        logger.debug(f"Starting proxy from_mesh, initiator={init}")
+        logger.debug(f"Starting proxy from_remote, initiator={init}")
         i = 0
         hs_acts = 2 if init else 1
         while True:
             message = await self.read_message(read, i, hs_acts, init, False)
             await write(message)
             i += 1
-            self.bytes_from_mesh += len(message)
+            self.bytes_from_remote += len(message)
             logger.debug(
                 f"Rcvd | "
                 f"read: {i}, "
                 f"sent: {i}, "
-                f"total_size: {self.bytes_from_mesh}B"
+                f"total_size: {self.bytes_from_remote}B"
             )
 
     async def start(self):
@@ -126,13 +126,13 @@ class Proxy:
         try:
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(
-                    self._to_mesh,
+                    self._to_remote,
                     self.stream,
                     self.node.outbound.send,
                     self.stream_init,
                 )
                 nursery.start_soon(
-                    self._from_mesh,
+                    self._from_remote,
                     self.node.inbound[1],
                     self.stream.send_all,
                     self.q_init,
@@ -150,8 +150,8 @@ class Proxy:
 
 
 async def handle_inbound(gid: int, task_status=trio.TASK_STATUS_IGNORED):
-    """Handle a new inbound connection from the mesh.
-    Will open a new connection to local C-Lightning node and then proxy the connections.
+    """Handle a new inbound connection.
+    Will open a new connection to local C-Lightning node and then proxy with the queue.
     """
     logger.info(f"Handling new incoming connection from GID: {gid}")
     # First connect to our local C-Lightning node.
@@ -166,8 +166,8 @@ async def handle_inbound(gid: int, task_status=trio.TASK_STATUS_IGNORED):
 
 
 async def handle_outbound(stream: trio.SocketStream, gid: int):
-    """Handles an outbound connection, creating the required (mesh) queues if necessary
-    and then proxying the connection with the mesh queue.
+    """Handles an outbound connection, creating the required queues if necessary
+    and then proxying the connection with the queue.
     """
     logger.info(f"Handling new outbound connection to GID: {gid}")
     # First we check if the node is in the router already:
@@ -177,7 +177,7 @@ async def handle_outbound(stream: trio.SocketStream, gid: int):
             f"to router before trying to reconnect"
         )
         return
-    # Next proxy between the stream and the node.
+    # Next proxy between the stream and the node queue.
     # stream_init is True because we are handshake initiator.
     router.init_node(gid)
     proxy = Proxy(stream, gid, True, False)

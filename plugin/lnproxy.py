@@ -6,62 +6,74 @@ import uuid
 
 import lightning
 import trio
-from goTenna.constants import GID_MAX
 from secp256k1 import PublicKey
 
-import lnproxy.config as config
-import lnproxy.network as network
-from lnproxy.mesh import connection_daemon
-from lnproxy.messages import EncryptedMessage
-from lnproxy.pk_from_hsm import get_privkey
-from lnproxy.proxy import serve_outbound
+import src.config as config
+import src.network as network
+from src.gotenna import gotenna_conn_daemon
+from src.messages import EncryptedMessage
+from src.pk_from_hsm import get_privkey
+from src.proxy import serve_outbound
 
-gotenna_plugin = lightning.Plugin()
+# Initialise the plugin
+plugin = lightning.Plugin()
+
+# Initialise the logger
 handler = logging.StreamHandler()
-bf = logging.Formatter("%(name)6s | %(levelname)8s | %(message)s")
-
+bf = logging.Formatter("%(name)7s | %(levelname)8s | %(message)s")
 handler.setFormatter(bf)
 logging.basicConfig(level=logging.DEBUG, handlers=[handler])
-logger = logging.getLogger("plugin")
-router = network.router
-send_id_len = config.user["gotenna"].getint("SEND_ID_LEN")
+logger = logging.getLogger("lnproxy")
 
-gotenna_plugin.add_option(
+# Initialise the plugin router, this is not currently persisted
+router = network.router
+
+# Set how many bytes to use for GID shortening. GID will be shortened using:
+# GID % (256 * send_id_len) which is equivalent to send_id_len bytes.
+# e.g. 1 byte is good for 256 unique GIDs (less collisions)
+send_id_len = config.user["message"].getint("SEND_ID_LEN")
+
+# User can specify transport communication channel by setting transport_comm_daemon below
+transport_comm_daemon = gotenna_conn_daemon
+
+
+plugin.add_option(
     name="gid",
     default=None,
-    description="A GID for connected goTenna device to use",
+    description="A GID for the transport layer to use",
     opt_type="int",
 )
 
 
-@gotenna_plugin.method("show-router")
+@plugin.method("show-router")
 def show_router(plugin=None):
-    """Returns the current view of the goTenna plugin's router.
+    """Returns the current view of the plugins router.
     """
     return str(router)
 
 
-@gotenna_plugin.method("gid")
+@plugin.method("gid")
 def get_gid(plugin=None):
-    """Returns the goTenna GID used by this node.
+    """Returns the GID used by this node.
     """
     return plugin.get_option("gid")
 
 
-@gotenna_plugin.method("add-node")
-def add_node(gid, pubkey, plugin=None):
-    """Add a mesh-connected node to the routing table.
-    arg: gid: integer within valid goTenna GID range
-    arg: pubkey: a node's lightning pubkey
+@plugin.method("add-node")
+def add_node(gid, pubkey, gotenna=False, plugin=None):
+    """Add a node to the plugin routing table.
+    arg: gid: integer (within 0 < n < MAX_GID range from config.ini)
+    arg: pubkey: a lightning pubkey
     """
-    # Check that GID and pubkey are valid
     _gid = int(gid)
-    if not 0 <= _gid <= GID_MAX:
-        return f"GID {_gid} not in range 0 <= n <= {GID_MAX}"
+    # Check that GID and pubkey are valid according to config.MAX_GID
+    if gotenna:
+        if not 0 <= _gid <= config.MAX_GID:
+            return f"GID {_gid} not in range 0 <= GID <= {config.MAX_GID}"
     try:
         _pubkey = PublicKey(pubkey=bytes.fromhex(pubkey), raw=True)
     except Exception as e:
-        logger.exception("Error with pubkey")
+        logger.exception("Error converting to valid pubkey from hex string")
         return f"Error with pubkey: {e}"
 
     # Add to router
@@ -80,12 +92,12 @@ def add_node(gid, pubkey, plugin=None):
         )
     else:
         router.add(_node)
-        return f"{_node} added to gotenna plugin router."
+        return f"{_node} added to plugin router."
 
 
-@gotenna_plugin.method("remove-node")
+@plugin.method("remove-node")
 def remove_node(gid, plugin=None):
-    """Remove a node from the network router using GID
+    """Remove a node from the plugin router by GID
     """
     if gid not in router:
         return f"GID {gid} not found in router."
@@ -97,16 +109,16 @@ def remove_node(gid, plugin=None):
         return f"Node with GID {gid} removed from router."
 
 
-@gotenna_plugin.method("proxy-connect")
+@plugin.method("proxy-connect")
 def proxy_connect(gid, plugin=None):
-    """Connect to a remote node via goTenna mesh proxy.
+    """Connect to a remote node via lnproxy.
     """
     _gid = int(gid)
     try:
         pubkey = router.get_pubkey(_gid)
     except LookupError as e:
         return f"Could not find GID {_gid} in router, try adding first.\n{e}"
-    logging.debug(f"proxy-connect to gid {_gid} via goTenna mesh connection")
+    logging.debug(f"proxy-connect to gid {_gid} via lnproxy plugin")
 
     # Generate a random fd to listen on for this outbound connection.
     listen_addr = f"/tmp/0{uuid.uuid4().hex}"
@@ -125,20 +137,21 @@ def proxy_connect(gid, plugin=None):
     return plugin.rpc.connect(str(pubkey), f"{listen_addr}")
 
 
-@gotenna_plugin.method("message")
+@plugin.method("message")
 def message(
     gid, message_string, msatoshi: int = 100_000, plugin=None,
 ):
-    """Send a message via the mesh connection paid for using key-send (non-interactive)
-    args: (goTenna) gid, msatoshi, msatoshi
+    """Send a message via the remote, paid for using key-send (non-interactive)
+    args: gid, message_string, msatoshi: default=100000
     """
     # Get the destination pubkey from the router
     dest_pubkey = network.router.get_pubkey(gid)
 
     # Get a unique "sender_id" which receiver can use to lookup sender pubkey
-    # sender_id will be 1 byte long as this allows 256 GID values; enough for now
+    # sender_id will be 1 byte long as this allows 256 GID values, enough for now
     sender_id = (int(plugin.get_option("gid")) % 256).to_bytes(send_id_len, "big")
 
+    # Create the encrypted message payload
     _message = EncryptedMessage(
         send_sk=config.node_secret_key,
         send_id=sender_id,
@@ -160,16 +173,18 @@ def message(
     description = f"{uuid.uuid4().hex} encrypted message to {_message.recv_pk}"
 
     # Store message object for later.
-    # The traffic proxy will add the encrypted message onto the outbound
-    # htlc_add_update message after lookup using payment_hash.
+    # The proxy will add the encrypted message onto the outbound htlc_add_update message
+    # after lookup using payment_hash.
     config.key_sends[_message.payment_hash] = _message
     logger.debug(f"Stored message in config.key_sends[{_message.payment_hash}]")
 
-    # Get next peer in route
-    # TODO: Improve routing here; tap into gotenna routing table.
+    # Get first peer in route
+    # TODO: Improve routing here; tap into outourced routing table.
     peer = config.rpc.listfunds()["channels"][0]["peer_id"]
-    logger.debug(f"Got next peer {peer}")
+    logger.debug(f"Got first peer: {peer}")
 
+    # As we don't presume to have the full network graph here, we must guesstimate the
+    # fees and CLTV somewhat here.
     # We add 10 satoshis to amount (10 hops max x 1 satoshi fee each)
     # We add 60 to cltv (10 hops max, CLTV of 6 each)
     amt_msat = int(msatoshi) + 10
@@ -184,10 +199,10 @@ def message(
     return config.rpc.sendpay(route, _message.payment_hash.hex(), description, amt_msat)
 
 
-@gotenna_plugin.init()
+@plugin.init()
 # Parameters used by gotenna_plugin() internally
 def init(options, configuration, plugin):
-    logger.info("Starting goTenna plugin")
+    logger.info("Starting lnproxy plugin")
 
     # Store the RPC in config to be accessible by all modules.
     config.rpc = plugin.rpc
@@ -201,7 +216,7 @@ def init(options, configuration, plugin):
     logger.debug(router)
 
     # ======= WARNING =======
-    # Store our node private key for message decryption
+    # Store our node private key in memory for message decryption
     config.node_secret_key = str(
         get_privkey(config.node_info["lightning-dir"], config.node_info["id"])
     )
@@ -215,7 +230,7 @@ def init(options, configuration, plugin):
     commands = list(plugin.methods.keys())
     commands.remove("init")
     commands.remove("getmanifest")
-    logger.info(f"goTenna plugin initialised. Added RPC commands: {commands}")
+    logger.info(f"lnproxy plugin initialised. Added RPC commands: {commands}")
 
 
 async def main():
@@ -226,13 +241,13 @@ async def main():
     # This nursery will run our main tasks for us:
     async with trio.open_nursery() as config.nursery:
         # We run the plugin itself in a synchronous thread so trio.run() maintains
-        # overall control of the app.
-        config.nursery.start_soon(trio.to_thread.run_sync, gotenna_plugin.run)
+        # overall control of the runtime.
+        config.nursery.start_soon(trio.to_thread.run_sync, plugin.run)
 
-        # Start the goTenna connection daemon.
-        config.nursery.start_soon(connection_daemon)
+        # Start the transport communication daemon.
+        config.nursery.start_soon(transport_comm_daemon)
 
-    logger.info("goTenna plugin exited.")
+    logger.info("lnproxy plugin exited.")
 
 
 trio.run(main)
